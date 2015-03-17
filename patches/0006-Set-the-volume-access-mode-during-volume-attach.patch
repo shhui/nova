@@ -1,0 +1,191 @@
+From f6e707c6be20184db94703c397ed591e411e2107 Mon Sep 17 00:00:00 2001
+From: Thang Pham <thang.g.pham@gmail.com>
+Date: Tue, 22 Apr 2014 15:00:06 -0400
+Subject: [PATCH] Set the volume access mode during volume attach
+
+cinderclient supports an optional keyword argument named 'mode'
+for volumes.attach(), which allows you to set the access mode of
+a volume at attach time. The keyword argument is not passed in
+by nova when it attaches a read-only volume, making the volume
+access mode default to 'rw' instead of the desired 'ro'. This
+patch finds the access mode of the volume and passes it to
+cinderclient, so the correct access mode is used at attach
+time.
+
+Change-Id: Ib62f454292e60114f96debbad96c4a356dc32a21
+Closes-Bug: #1307088
+(cherry picked from commit de05c2994212e83eba3cedf2544cdc549d9f8184)
+---
+ nova/tests/compute/test_compute.py   |  3 ++-
+ nova/tests/fake_volume.py            |  2 +-
+ nova/tests/virt/test_block_device.py | 23 +++++++++++++++++++----
+ nova/tests/volume/test_cinder.py     | 27 +++++++++++++++++++++------
+ nova/virt/block_device.py            |  8 ++++++--
+ nova/volume/cinder.py                |  4 ++--
+ 6 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/nova/tests/compute/test_compute.py b/nova/tests/compute/test_compute.py
+index 9c0ddaa..fdcd678 100644
+--- a/nova/tests/compute/test_compute.py
++++ b/nova/tests/compute/test_compute.py
+@@ -4084,7 +4084,8 @@ class ComputeTestCase(BaseTestCase):
+             return connection_info
+         self.stubs.Set(cinder.API, "initialize_connection", fake_init_conn)
+ 
+-        def fake_attach(self, context, volume_id, instance_uuid, device_name):
++        def fake_attach(self, context, volume_id, instance_uuid, device_name,
++                        mode='rw'):
+             volume['instance_uuid'] = instance_uuid
+             volume['device_name'] = device_name
+         self.stubs.Set(cinder.API, "attach", fake_attach)
+diff --git a/nova/tests/fake_volume.py b/nova/tests/fake_volume.py
+index 607fb50..3455353 100644
+--- a/nova/tests/fake_volume.py
++++ b/nova/tests/fake_volume.py
+@@ -200,7 +200,7 @@ class API(object):
+             msg = _("already detached")
+             raise exception.InvalidVolume(reason=msg)
+ 
+-    def attach(self, context, volume_id, instance_uuid, mountpoint):
++    def attach(self, context, volume_id, instance_uuid, mountpoint, mode='rw'):
+         LOG.info('attaching volume %s', volume_id)
+         volume = self.get(context, volume_id)
+         volume['status'] = 'in-use'
+diff --git a/nova/tests/virt/test_block_device.py b/nova/tests/virt/test_block_device.py
+index 1f724e6..ae6d16e 100644
+--- a/nova/tests/virt/test_block_device.py
++++ b/nova/tests/virt/test_block_device.py
+@@ -280,7 +280,7 @@ class TestDriverBlockDevice(test.NoDBTestCase):
+     def _test_volume_attach(self, driver_bdm, bdm_dict,
+                             fake_volume, check_attach=True,
+                             fail_check_attach=False, driver_attach=False,
+-                            fail_driver_attach=False):
++                            fail_driver_attach=False, access_mode='rw'):
+         elevated_context = self.context.elevated()
+         self.stubs.Set(self.context, 'elevated',
+                        lambda: elevated_context)
+@@ -288,8 +288,8 @@ class TestDriverBlockDevice(test.NoDBTestCase):
+         self.mox.StubOutWithMock(encryptors, 'get_encryption_metadata')
+         instance = {'id': 'fake_id', 'uuid': 'fake_uuid'}
+         connector = {'ip': 'fake_ip', 'host': 'fake_host'}
+-        connection_info = {'data': {}}
+-        expected_conn_info = {'data': {},
++        connection_info = {'data': {'access_mode': access_mode}}
++        expected_conn_info = {'data': {'access_mode': access_mode},
+                               'serial': fake_volume['id']}
+         enc_data = {'fake': 'enc_data'}
+ 
+@@ -333,7 +333,8 @@ class TestDriverBlockDevice(test.NoDBTestCase):
+                 return instance, expected_conn_info
+ 
+         self.volume_api.attach(elevated_context, fake_volume['id'],
+-                          'fake_uuid', bdm_dict['device_name']).AndReturn(None)
++                          'fake_uuid', bdm_dict['device_name'],
++                          mode=access_mode).AndReturn(None)
+         driver_bdm._bdm_obj.save(self.context).AndReturn(None)
+         return instance, expected_conn_info
+ 
+@@ -352,6 +353,20 @@ class TestDriverBlockDevice(test.NoDBTestCase):
+         self.assertThat(test_bdm['connection_info'],
+                         matchers.DictMatches(expected_conn_info))
+ 
++    def test_volume_attach_ro(self):
++        test_bdm = self.driver_classes['volume'](self.volume_bdm)
++        volume = {'id': 'fake-volume-id-1'}
++
++        instance, expected_conn_info = self._test_volume_attach(
++                test_bdm, self.volume_bdm, volume, access_mode='ro')
++
++        self.mox.ReplayAll()
++
++        test_bdm.attach(self.context, instance,
++                        self.volume_api, self.virt_driver)
++        self.assertThat(test_bdm['connection_info'],
++                        matchers.DictMatches(expected_conn_info))
++
+     def check_volume_attach_check_attach_fails(self):
+         test_bdm = self.driver_classes['volume'](
+             self.volume_bdm)
+diff --git a/nova/tests/volume/test_cinder.py b/nova/tests/volume/test_cinder.py
+index c12bdc2..1ef7097 100644
+--- a/nova/tests/volume/test_cinder.py
++++ b/nova/tests/volume/test_cinder.py
+@@ -13,6 +13,8 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++import mock
++
+ from cinderclient import exceptions as cinder_exception
+ 
+ from nova import context
+@@ -169,15 +171,28 @@ class CinderApiTestCase(test.NoDBTestCase):
+ 
+         self.api.roll_detaching(self.ctx, 'id1')
+ 
+-    def test_attach(self):
+-        cinder.cinderclient(self.ctx).AndReturn(self.cinderclient)
+-        self.mox.StubOutWithMock(self.cinderclient.volumes,
+-                                 'attach')
+-        self.cinderclient.volumes.attach('id1', 'uuid', 'point')
+-        self.mox.ReplayAll()
++    @mock.patch('nova.volume.cinder.cinderclient')
++    def test_attach(self, mock_cinderclient):
++        mock_volumes = mock.MagicMock()
++        mock_cinderclient.return_value = mock.MagicMock(volumes=mock_volumes)
+ 
+         self.api.attach(self.ctx, 'id1', 'uuid', 'point')
+ 
++        mock_cinderclient.assert_called_once_with(self.ctx)
++        mock_volumes.attach.assert_called_once_with('id1', 'uuid', 'point',
++                                                    mode='rw')
++
++    @mock.patch('nova.volume.cinder.cinderclient')
++    def test_attach_with_mode(self, mock_cinderclient):
++        mock_volumes = mock.MagicMock()
++        mock_cinderclient.return_value = mock.MagicMock(volumes=mock_volumes)
++
++        self.api.attach(self.ctx, 'id1', 'uuid', 'point', mode='ro')
++
++        mock_cinderclient.assert_called_once_with(self.ctx)
++        mock_volumes.attach.assert_called_once_with('id1', 'uuid', 'point',
++                                                    mode='ro')
++
+     def test_detach(self):
+         cinder.cinderclient(self.ctx).AndReturn(self.cinderclient)
+         self.mox.StubOutWithMock(self.cinderclient.volumes,
+diff --git a/nova/virt/block_device.py b/nova/virt/block_device.py
+index 319a368..b697e01 100644
+--- a/nova/virt/block_device.py
++++ b/nova/virt/block_device.py
+@@ -247,8 +247,12 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
+                     volume_api.terminate_connection(context, volume_id,
+                                                     connector)
+         self['connection_info'] = connection_info
+-        volume_api.attach(context, volume_id,
+-                          instance['uuid'], self['mount_device'])
++
++        mode = 'rw'
++        if 'data' in connection_info:
++            mode = connection_info['data'].get('access_mode', 'rw')
++        volume_api.attach(context, volume_id, instance['uuid'],
++                          self['mount_device'], mode=mode)
+ 
+     @update_db
+     def refresh_connection_info(self, context, instance,
+diff --git a/nova/volume/cinder.py b/nova/volume/cinder.py
+index b06b05f..1d4cb85 100644
+--- a/nova/volume/cinder.py
++++ b/nova/volume/cinder.py
+@@ -257,9 +257,9 @@ class API(object):
+         cinderclient(context).volumes.roll_detaching(volume_id)
+ 
+     @translate_volume_exception
+-    def attach(self, context, volume_id, instance_uuid, mountpoint):
++    def attach(self, context, volume_id, instance_uuid, mountpoint, mode='rw'):
+         cinderclient(context).volumes.attach(volume_id, instance_uuid,
+-                                             mountpoint)
++                                             mountpoint, mode=mode)
+ 
+     @translate_volume_exception
+     def detach(self, context, volume_id):
