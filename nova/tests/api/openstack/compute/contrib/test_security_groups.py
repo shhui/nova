@@ -80,7 +80,7 @@ def security_group_rule_db(rule, id=None):
 
 
 def return_server(context, server_id,
-                  columns_to_join=None, use_slave=False):
+                  columns_to_join=None, use_subordinate=False):
     return fake_instance.fake_db_instance(
         **{'id': int(server_id),
            'power_state': 0x01,
@@ -91,7 +91,7 @@ def return_server(context, server_id,
 
 def return_server_by_uuid(context, server_uuid,
                           columns_to_join=None,
-                          use_slave=False):
+                          use_subordinate=False):
     return fake_instance.fake_db_instance(
         **{'id': 1,
            'power_state': 0x01,
@@ -360,7 +360,7 @@ class TestSecurityGroups(test.TestCase):
         expected = {'security_groups': groups}
 
         def return_instance(context, server_id,
-                            columns_to_join=None, use_slave=False):
+                            columns_to_join=None, use_subordinate=False):
             self.assertEqual(server_id, FAKE_UUID1)
             return return_server_by_uuid(context, server_id)
 
@@ -1639,7 +1639,7 @@ class SecurityGroupsOutputXmlTest(SecurityGroupsOutputTest):
             root.set('id')
             root.set('imageRef')
             root.set('flavorRef')
-            return xmlutil.MasterTemplate(root, 1,
+            return xmlutil.MainTemplate(root, 1,
                                           nsmap={None: xmlutil.XMLNS_V11})
 
     def _encode_body(self, body):
